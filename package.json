@@ -1,0 +1,53 @@
+{
+  "name": "retailcompare-backend",
+  "version": "0.1.0",
+  "description": "Cross-supplier grocery ordering assistant — comparison & allocation core",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "demo": "tsx src/demo.ts",
+    "prepare-order": "tsx src/scripts/prepareOrder.ts",
+    "sync:categories": "tsx src/scripts/syncMusgraveCategories.ts",
+    "sync:products": "tsx src/scripts/syncMusgraveProducts.ts",
+    "sync:oreilly": "tsx src/scripts/syncOreillyProducts.ts",
+    "db:check": "tsx src/scripts/checkSupabase.ts",
+    "admin:create-user": "tsx src/scripts/createAdminUser.ts",
+    "test:local-match": "tsx src/scripts/testLocalCatalogueMatch.ts",
+    "poc:bulk-search": "tsx src/scripts/bulkSearchPoc.ts",
+    "debug:search": "tsx src/scripts/debugSearchPipeline.ts",
+    "debug:product": "tsx src/scripts/debugProduct.ts",
+    "test:sbert": "tsx src/scripts/testSbertPipeline.ts",
+    "compare:queries": "tsx src/scripts/compareQueryStrategies.ts",
+    "analyse:rules": "tsx src/scripts/analyseRuleFailures.ts",
+    "serve": "tsx src/main.ts",
+    "dev": "nodemon",
+    "seed": "tsx src/seed.ts",
+    "test:oreilly": "tsx test/oreilly.test.ts",
+    "test:musgrave": "tsx test/musgrave.test.ts",
+    "test:compare": "tsx test/compare.test.ts"
+  },
+  "devDependencies": {
+    "@types/geoip-lite": "^1.4.4",
+    "@types/node": "^22.20.1",
+    "nodemon": "^3.1.14",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.111.0",
+    "axios": "^1.18.1",
+    "axios-cookiejar-support": "^7.0.0",
+    "cheerio": "^1.2.0",
+    "dotenv": "^17.4.2",
+    "geoip-lite": "^2.0.3",
+    "tough-cookie": "^6.0.2",
+    "xlsx": "^0.18.5"
+  }
+}

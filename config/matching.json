@@ -1,0 +1,80 @@
+{
+  "$comment": [
+    "Business policy for candidate acceptance and supplier selection.",
+    "",
+    "Separate from normalization.json on purpose: that file is VOCABULARY",
+    "(what words mean), this one is POLICY (what the business will accept and",
+    "how it chooses). They change for different reasons and by different people.",
+    "",
+    "Nothing here names a product."
+  ],
+
+  "$comment_supplierSelection": [
+    "The buying objective: among candidates that passed BOTH the rule engine",
+    "and reconciliation, take the lowest ex-VAT case price.",
+    "",
+    "Supplier preference is a TIE-BREAKER ONLY. It applies when two prices are",
+    "effectively equal — within priceTieToleranceEur — and never overrides a",
+    "genuinely cheaper equivalent product.",
+    "",
+    "This replaces the earlier per-supplier percentage thresholds, which let a",
+    "supplier 11.8% cheaper lose to preference because it had not cleared a 13%",
+    "bar. Those thresholds remain in SUPPLIERS for the basket-level allocation",
+    "engine, where they model switching cost across a whole order rather than",
+    "the per-line choice shown on the dashboard."
+  ],
+  "supplierSelection": {
+    "priceTieToleranceEur": 0.05,
+    "preferenceOrder": ["musgrave", "oreilly"]
+  },
+
+  "$comment_unitSize": [
+    "A unit-size difference when the CASE CONFIGURATION is identical.",
+    "",
+    "  requested 48 x 48g   available 48 x 40g   -> same case, smaller unit",
+    "",
+    "That is a stocking decision for a human, not a wrong product: the retailer",
+    "may well take 40g if 48g is unavailable. Within nearMatchPct it is reported",
+    "as a WARNING and the line still passes; beyond it, the products are too far",
+    "apart and it stays a hard mismatch.",
+    "",
+    "A differing units-per-case is ALWAYS critical and is not affected by this —",
+    "24 x 38 versus 4 x 34 is a different commercial product, which is the case",
+    "that proved SBERT alone was insufficient."
+  ],
+  "unitSize": {
+    "nearMatchPct": 0.25
+  },
+
+  "$comment_packDifference": [
+    "What a PACK SIZE difference does when the product identity already matches.",
+    "",
+    "  warn   (default) the line reaches Ready To Order with the difference",
+    "         stated, and the other sizes appear as alternatives in the popup.",
+    "         The retailer decides — they can see 30x14 was requested and",
+    "         10x14 is what the supplier sells.",
+    "  reject the line goes to Needs Attention instead.",
+    "",
+    "'warn' is the retailer's call: a size difference is a QUANTITY question,",
+    "not a wrong product, and hiding the line entirely means they never learn",
+    "the product is available at all.",
+    "",
+    "IDENTITY differences are unaffected and stay hard rejections — a different",
+    "variant, alcohol strength, form or container is a different PRODUCT, and no",
+    "amount of size tolerance makes Diet Coke into Coke Zero."
+  ],
+  "packDifference": "warn",
+
+  "$comment_variant": [
+    "Extra words on the supplier's side are ALWAYS a variant rejection. There is",
+    "no tolerance setting here on purpose.",
+    "",
+    "A tempting alternative — 'only reject if the supplier also listed a plain",
+    "version' — is unsound: a supplier stocking only 'Kinder Bueno White' would",
+    "then have White accepted as plain Bueno.",
+    "",
+    "Words that carry no commercial identity are removed earlier instead, by",
+    "`decorations` in normalization.json, so they never reach the variant rule.",
+    "That is the knob to turn when a verified-correct product is rejected."
+  ]
+}
