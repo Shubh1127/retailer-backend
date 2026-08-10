@@ -64,6 +64,44 @@ Check it:
 curl http://localhost:8787/api/health
 ```
 
+`/api/health` probes its dependencies for real rather than reporting process
+state, so it is the fastest way to tell a misconfigured server from a broken
+one:
+
+```jsonc
+{
+  "ok": true,                    // tracks the DATABASE only — see below
+  "version": "0.1.0",
+  "uptimeSeconds": 412,
+  "database": {
+    "reachable": true,
+    "persistence": true,         // false when SUPABASE_* is unset:
+                                 // jobs run but are never stored
+    "rows": {                    // null (not 0) when a table can't be reached
+      "musgrave_products": 38331,
+      "oreilly_products": 5576,
+      "processed_products": 1204
+    }
+  },
+  "aiService": {
+    "reachable": true,
+    "status": "ok",
+    "model": "all-MiniLM-L6-v2"
+  }
+}
+```
+
+Two things worth knowing about the contract:
+
+- **It always answers `200`.** The API keeps serving without Supabase, so
+  failing the HTTP status would pull a still-useful process out of a load
+  balancer. `ok` carries the truth instead.
+- **`ok` tracks the database, not the AI service.** A missing AI service
+  degrades matching rather than stopping it — every similarity falls back to
+  `0` and the deterministic rules still decide — so it is reported and cannot
+  fail the check. If `aiService.reachable` is `false`, matches will still be
+  produced, just worse.
+
 The full pipeline also needs the **AI service** running (see `../ai-service`).
 Without it, SBERT calls fail and the rules fall back to neutral similarity —
 degraded, not broken.
@@ -166,39 +204,32 @@ afterwards, and nothing is cached.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/api/compare/search?q=` | Search every supplier for one product and compare |
+| `GET` | `/api/compare/search?q=` | Search every supplier for one product and compare. **Authenticated** |
 | `POST` | `/api/compare` | Compare + allocate the current order list |
 | `POST` | `/api/allocate` | Run allocation over `lines[]` |
 | `POST` | `/api/reconcile` | Cart read-back reconciliation |
-| `GET` | `/api/reports` | Latest allocation summary |
-| `GET` | `/api/suppliers/musgrave/search?q=` | Raw Musgrave search, for debugging |
 
 ### Import
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `POST` | `/api/import/epos-listing` | Parse an EPOS `.xls` (base64) → articles |
-| `POST` | `/api/import/epos` | Parse **and** map to catalogue products |
 | `POST` | `/api/import/supplier` | Seed prices + matches from a supplier CSV |
 | `POST` | `/api/import/order-list` | Parse a product-list CSV |
-| `POST` | `/api/import/catalog` | Bulk catalogue harvest (`rows[]` or `table`) |
 | `POST` | `/api/orders/prepare` | EPOS file → matched SKUs → per-supplier order CSVs |
+
+To upload an EPOS listing and actually process it, use `POST /api/jobs`
+(see **Processing jobs** above) — that is the supported path.
 
 ### State, suppliers, catalogue
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/api/health` | Version + record counts |
+| `GET` | `/api/health` | Live dependency state + real row counts — see above |
 | `GET` | `/api/state` | Everything the dashboard needs in one call |
-| `GET` | `/api/catalog` · `/api/catalog/stats` | Canonical products, mapping coverage |
+| `GET` | `/api/catalog` | Canonical products |
 | `GET` `PUT` | `/api/suppliers` | Read / replace suppliers |
 | `PATCH` | `/api/suppliers/:id` | Edit buying rules (preference, margin, min order, delivery) |
-| `PATCH` | `/api/matches/:id` | Patch a mapping |
-| `POST` | `/api/matches/:id/{confirm,set-preferred,reverify}` | Mappings cockpit actions |
-| `GET` | `/api/price-history?sku=` | Recent price changes |
-| `POST` | `/api/mode` | `stealth` \| `full` |
-| `POST` | `/api/refresh/plan` · `/api/refresh/results` · `/api/refresh/run` | On-device price refresh |
-| `POST` | `/api/seed-demo` · `/api/seed-demo-sample` | Seed a demo catalogue (test mode) |
+| `POST` | `/api/refresh/plan` · `/api/refresh/results` | On-device price refresh |
 
 ### Machine learning
 
@@ -208,6 +239,41 @@ afterwards, and nothing is cached.
 
 Walk `nextOffset` until it is `null`; neither side ever holds the whole
 catalogue.
+
+### Disabled routes
+
+These twelve are commented out in `src/server.ts`. Each had **no caller
+anywhere in the repository** — not the webapp, the admin dashboard, the iOS
+app, the userscript, the prototype, or the test suite.
+
+They are commented rather than deleted because several are the seam a future
+feature would reattach to, and a commented block says "this existed and was
+switched off" where a deletion says nothing at all. Each one's imports are
+commented out beside it, so re-enabling means uncommenting two adjacent things.
+
+| Path | Why it is off |
+| --- | --- |
+| `POST /api/import/catalog` | The manual route to a populated matching table, before the supplier syncs took that job |
+| `GET /api/catalog/stats` | Coverage report for the above |
+| `POST /api/import/epos-listing` | Superseded by `POST /api/jobs`, which parses the same `.xls` and then processes it |
+| `POST /api/import/epos` | Auto-mapping EPOS import. Matched by name against the in-memory store using the *order-file* matcher, not the dashboard one |
+| `POST /api/mode` | `stealth` \| `full` on the in-memory store |
+| `POST /api/seed-demo` · `/api/seed-demo-sample` | TEST MODE by their own comments. They call `replaceCatalog`, not merge — one typo from overwriting a real catalogue with fixture data |
+| `POST /api/refresh/run` | Simulated price movements |
+| `PATCH /api/matches/:id` | Mappings cockpit. Wrote `store.matches` in memory, so a confirmation survived until the next restart |
+| `POST /api/matches/:id/{confirm,set-preferred,reverify}` | Same. `reverify` never verified anything — it stamped a success timestamp unconditionally |
+| `GET /api/price-history?sku=` | Read side of the in-memory price log |
+| `GET /api/reports` | Allocation summary over the in-memory store |
+| `GET /api/suppliers/musgrave/search?q=` | **Unauthenticated** live search against a logged-in trade account, while `/api/compare/search` beside it was deliberately gated. If you need it back, put it behind `authenticateUser` first — do not simply uncomment it |
+
+Confirming a product mapping now happens through
+`POST /api/admin/jobs/:jobId/rows/:row/confirm`, which writes `product_overrides`
+in Supabase.
+
+Everything the iOS app, the userscript and `test/server.test.ts` still call is
+untouched: `/api/refresh/plan`, `/api/refresh/results`, `/api/allocate`,
+`/api/catalog`, `/api/import/supplier`, `/api/import/order-list`,
+`/api/reconcile`, `/api/state` and `/api/compare`.
 
 ---
 

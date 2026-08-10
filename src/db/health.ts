@@ -66,13 +66,21 @@ function toSupabaseError(error: unknown): SupabaseError {
  */
 export async function checkSupabaseConnection(
   table: string = PROBE_TABLE,
+  /**
+   * Column to select. Defaults to `id`, which every table this was written for
+   * has — but not every table in the schema does: `processed_products` is keyed
+   * `(job_id, source_row)` and has no `id` at all, so probing it with the
+   * default reported "column does not exist" and a healthy database looked
+   * broken. Pass any column the table definitely has.
+   */
+  column = 'id',
 ): Promise<SupabaseCheckResult> {
   try {
     const supabase = getSupabaseClient();
 
     const { count, data, error, status } = await supabase
       .from(table)
-      .select('id', { count: 'exact' })
+      .select(column, { count: 'exact' })
       .limit(1);
 
     if (error) {

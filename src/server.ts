@@ -4,7 +4,7 @@
  * from `listen` so tests can exercise it without binding a port in CI.
  *
  * Routes (all under /api):
- *   GET  /health                 → { ok, version, counts }
+ *   GET  /health                 → live dependency + row-count state
  *   GET  /suppliers              → Supplier[]
  *   PUT  /suppliers              → replace suppliers (body: Supplier[])
  *   GET  /catalog                → CanonicalProduct[]
@@ -18,6 +18,30 @@
  * `jobs/jobRoutes.ts` and are dispatched before the routes above.
  *
  * Supplier credentials are never accepted or stored here — auth stays on-device.
+ *
+ * ---------------------------------------------------------------------------
+ * Disabled routes
+ * ---------------------------------------------------------------------------
+ * The blocks marked `DISABLED` below had no caller anywhere in the repository —
+ * not the webapp, the admin dashboard, the iOS app, the userscript, the
+ * prototype, or the test suite. They are commented out rather than deleted
+ * because several are the seam a future feature would reattach to (the mappings
+ * cockpit, the catalogue harvest, the demo seeder), and a commented block says
+ * "this existed and was switched off" where a deletion says nothing at all.
+ *
+ * Their imports are commented out beside them, so re-enabling one means
+ * uncommenting two adjacent things and nothing else.
+ *
+ *   POST /import/catalog          POST /seed-demo
+ *   GET  /catalog/stats           POST /seed-demo-sample
+ *   POST /import/epos-listing     POST /import/epos
+ *   POST /mode                    POST /refresh/run
+ *   PATCH/POST /matches/…         GET  /price-history
+ *   GET  /reports                 GET  /suppliers/musgrave/search
+ *
+ * Everything the iOS app, the userscript and `test/server.test.ts` still call
+ * is untouched — /refresh/plan, /refresh/results, /allocate, /catalog,
+ * /import/supplier, /import/order-list, /reconcile, /state and /compare.
  */
 
 import {
@@ -25,7 +49,8 @@ import {
   type IncomingMessage,
   type ServerResponse,
 } from "node:http";
-import { searchMusgrave } from "./services/musgrave.service.js";
+// DISABLED with GET /api/suppliers/musgrave/search.
+// import { searchMusgrave } from "./services/musgrave.service.js";
 import { compareProducts } from "./services/compare.service.js";
 import {
   exportMusgraveProducts,
@@ -35,18 +60,21 @@ import {
 import { prepareSupplierOrderFiles } from "./services/orderFile.service.js";
 import { readFile as readFileFs } from "node:fs/promises";
 import { join, normalize, extname } from "node:path";
-import type { Store, OrderLine } from "./store.js";
-import { buildDemoCatalog, simulateRefresh } from "./simulate.js";
-import { pickBestMatch } from "./connectors/match.js";
+import type { Store } from "./store.js";
 import { importSupplierFile, type ColumnMapping } from "./ingest/import.js";
 import { importOrderList, type OrderListMapping } from "./ingest/orderList.js";
-import { importEposListing } from "./ingest/eposListing.js";
-import {
-  parseCatalogTable,
-  importSupplierCatalog,
-  catalogStats,
-  type CatalogRow,
-} from "./ingest/catalog.js";
+// DISABLED — each of these had exactly one caller, and that caller is one of the
+// commented-out route blocks below. `OrderLine` went with POST /api/import/epos.
+// import type { OrderLine } from "./store.js";
+// import { buildDemoCatalog, simulateRefresh } from "./simulate.js";
+// import { pickBestMatch } from "./connectors/match.js";
+// import { importEposListing } from "./ingest/eposListing.js";
+// import {
+//   parseCatalogTable,
+//   importSupplierCatalog,
+//   catalogStats,
+//   type CatalogRow,
+// } from "./ingest/catalog.js";
 import { buildFetchPlan, applyFetchResults } from "./refresh.js";
 import { prepareLine, type PrepareContext } from "./allocation/offers.js";
 import { allocate } from "./allocation/engine.js";
@@ -57,6 +85,9 @@ import { handleAdminRoute } from "./services/adminRoutes.js";
 import { handleMeRoute } from "./services/meRoutes.js";
 import { AuthError, authenticateUser } from "./services/auth.js";
 import { publish } from "./jobs/activityBus.js";
+import { checkSupabaseConnection } from "./db/health.js";
+import { checkAiService } from "./services/aiMatch.client.js";
+import { isPersistenceEnabled } from "./repositories/processingJob.repository.js";
 import type { AllocationConfig, OrderRequestLine } from "./types.js";
 import dotenv from "dotenv";
 
@@ -227,14 +258,6 @@ export function createApp(store: Store) {
       const url = new URL(req.url ?? "/", "http://localhost");
       const path = url.pathname.replace(/\/+$/, "") || "/";
       const method = req.method ?? "GET";
-      console.log("================================");
-      console.log("Incoming Request");
-      console.log("Method :", method);
-      console.log("URL    :", req.url);
-      console.log("Path   :", path);
-      console.log("Origin :", req.headers.origin);
-      console.log("Host   :", req.headers.host);
-      console.log("================================");
 
       if (method === "OPTIONS") return send(res, 204, {});
 
@@ -257,15 +280,71 @@ export function createApp(store: Store) {
       // drift from the gate that enforces the answer.
       if (await handleMeRoute(req, res, method, path)) return;
 
+      // Live dependency state, not in-memory bookkeeping.
+      //
+      // This used to report `store.{suppliers,products,matches,quotes}.length`.
+      // Those are the legacy in-memory store, which nothing populates in
+      // production once the job pipeline took over — so a perfectly healthy
+      // server answered `0, 0, 0, 0` and a completely broken one answered the
+      // same. The numbers were real; they just described a structure the live
+      // system no longer fills.
+      //
+      // What actually has to be up is Supabase (every catalogue and every
+      // finished job lives there) and, for full matching quality, the AI
+      // service. Both are probed for real, concurrently so the AI service's 5s
+      // timeout cannot stack on top of the database round-trips.
       if (method === "GET" && path === "/api/health") {
+        const [musgrave, oreilly, processed, ai] = await Promise.all([
+          checkSupabaseConnection("musgrave_products"),
+          checkSupabaseConnection("oreilly_products"),
+          // Keyed (job_id, source_row) — no `id` column to probe with.
+          checkSupabaseConnection("processed_products", "job_id"),
+          checkAiService(),
+        ]);
+
+        const probes = [musgrave, oreilly, processed];
+        const dbReachable = probes.every((p) => p.ok);
+        // First failure only. Three copies of the same "invalid API key" is
+        // noise; the table name on the one that failed is the signal.
+        const dbFailure = probes.find((p) => !p.ok);
+
+        // Always 200, never 503. `db/health.ts` is explicit that the API keeps
+        // serving without Supabase, so failing the check would pull a
+        // still-useful process out of a load balancer. `ok` carries the truth.
         return send(res, 200, {
-          ok: true,
+          // The database is the hard dependency. The AI service degrades
+          // matching rather than stopping it — when it is unreachable every
+          // similarity falls back to 0 and the deterministic rules still run —
+          // so it is reported but cannot fail the check.
+          ok: dbReachable,
           version: VERSION,
-          counts: {
-            suppliers: store.suppliers.length,
-            products: store.products.length,
-            matches: store.matches.length,
-            quotes: store.quotes.length,
+          uptimeSeconds: Math.round(process.uptime()),
+          database: {
+            reachable: dbReachable,
+            /** False when SUPABASE_* is unset: jobs run but are never stored. */
+            persistence: isPersistenceEnabled(),
+            rows: {
+              // null, not 0 — "we could not ask" and "the table is empty" are
+              // different answers and only one of them is a problem.
+              musgrave_products: musgrave.ok ? (musgrave.count ?? 0) : null,
+              oreilly_products: oreilly.ok ? (oreilly.count ?? 0) : null,
+              processed_products: processed.ok ? (processed.count ?? 0) : null,
+            },
+            ...(dbFailure
+              ? {
+                  failingTable: dbFailure.table,
+                  error: dbFailure.error?.message ?? "Unknown error",
+                  ...(dbFailure.tableMissing
+                    ? { hint: "Table does not exist — apply supabase/migrations." }
+                    : {}),
+                }
+              : {}),
+          },
+          aiService: {
+            reachable: ai.reachable,
+            ...(ai.status ? { status: ai.status } : {}),
+            ...(ai.model ? { model: ai.model } : {}),
+            ...(ai.error ? { error: ai.error } : {}),
           },
         });
       }
@@ -349,6 +428,16 @@ export function createApp(store: Store) {
         return send(res, 200, result);
       }
 
+      /* DISABLED — no caller anywhere in the repository.
+       *
+       * The catalogue harvest and its coverage report were the manual route to
+       * a populated matching table, before the supplier syncs
+       * (musgraveProducts.sync / oreillyProducts.sync) took that job.
+       *
+       * `/api/import/epos-listing` is superseded by POST /api/jobs, which parses
+       * the same .xls and then actually processes it. Keeping a second parser
+       * reachable meant two ways to read one file that could drift apart.
+
       if (method === "POST" && path === "/api/import/catalog") {
         // Supplier catalog harvest (Name/Size/SKU/EAN) → shared map with direct
         // URLs, no searching. Accepts either a markdown/CSV `table` string OR a
@@ -404,6 +493,8 @@ export function createApp(store: Store) {
           skipped: result.skipped,
         });
       }
+
+      */
 
       // EPOS listing → search both suppliers → confident matches → per-supplier
       // order CSVs. Stops at CSV text: no upload, no cart, no automation.
@@ -507,6 +598,19 @@ export function createApp(store: Store) {
       // ---- Dashboard routes ----
       if (method === "GET" && path === "/api/state")
         return send(res, 200, fullState(store));
+
+      /* DISABLED — no caller anywhere in the repository.
+       *
+       * The demo seeders and the simulated refresh are TEST MODE by their own
+       * comments: they fabricate a catalogue and invent price movements. Live
+       * on the same router as the real import paths, they were one typo away
+       * from overwriting a real catalogue with fixture data — `replaceCatalog`,
+       * not merge.
+       *
+       * `/api/import/epos` is the auto-mapping variant of the EPOS import; it
+       * matches by name against the in-memory store using `pickBestMatch`,
+       * which is the order-file matcher, not the dashboard one. POST /api/jobs
+       * is the supported path.
 
       if (method === "POST" && path === "/api/mode") {
         const body = await readJson(req);
@@ -639,6 +743,8 @@ export function createApp(store: Store) {
         });
       }
 
+      */
+
       // Compare + allocate the current order list.
       if (method === "POST" && path === "/api/compare") {
         const body = await readJson(req).catch(() => ({}));
@@ -661,6 +767,17 @@ export function createApp(store: Store) {
           mode: store.mode,
         });
       }
+
+      /* DISABLED — no caller anywhere in the repository.
+       *
+       * The mappings cockpit (patch / confirm / set-preferred / reverify) and
+       * its two read-side companions. Confirming a mapping now happens through
+       * POST /api/admin/jobs/:jobId/rows/:row/confirm, which writes
+       * `product_overrides` in Supabase; these wrote `store.matches` in memory,
+       * so a confirmation made here survived exactly until the next restart.
+       *
+       * `reverify` never verified anything — it stamped a success timestamp
+       * unconditionally, as its own trailing comment admits.
 
       // Mappings cockpit: patch / confirm / set-preferred / reverify.
       if (method === "PATCH" && path.startsWith("/api/matches/")) {
@@ -720,6 +837,8 @@ export function createApp(store: Store) {
         });
       }
 
+      */
+
       if (method === "GET" && path === "/api/compare/search") {
         // The last retailer-facing route that was still open. It runs live
         // supplier searches against logged-in trade accounts, so leaving it
@@ -768,6 +887,20 @@ export function createApp(store: Store) {
         }
       }
 
+      /* DISABLED — no caller, and the one worth disabling on its own merits.
+       *
+       * The README described this as "raw Musgrave search, for debugging". It
+       * ran a live search against a logged-in trade account with NO
+       * authentication, while GET /api/compare/search directly above it was
+       * deliberately gated for exactly that reason: anyone who could reach the
+       * host could spend the account's rate limit, and no search could be
+       * attributed to anybody. Debug convenience is not worth that.
+       *
+       * It also logged the raw query to stdout on every request.
+       *
+       * If you need it back, put it behind `authenticateUser` and drop the
+       * console.log lines — do not simply uncomment it.
+
       if (method === "GET" && path === "/api/suppliers/musgrave/search") {
         console.log("Musgrave search request received");
 
@@ -792,6 +925,8 @@ export function createApp(store: Store) {
         }
       }
 
+      */
+
       // ---- Machine learning ----
       //
       // Training-data export, consumed ONLY by the Query Understanding dataset
@@ -800,11 +935,7 @@ export function createApp(store: Store) {
       if (method === "GET" && path === "/api/ml/musgrave-products") {
         try {
           const { limit, offset } = readPageParams(url.searchParams);
-          return send(
-            res,
-            200,
-            await exportMusgraveProducts({ limit, offset }),
-          );
+          return send(res, 200, await exportMusgraveProducts({ limit, offset }));
         } catch (error) {
           if (error instanceof MlExportError) {
             throw new HttpError(error.status, error.message);
