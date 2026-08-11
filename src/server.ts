@@ -83,6 +83,7 @@ import { handleJobRoute } from "./jobs/jobRoutes.js";
 import { handleCartRoute } from "./services/cartRoutes.js";
 import { handleAdminRoute } from "./services/adminRoutes.js";
 import { handleMeRoute } from "./services/meRoutes.js";
+import { handleSignupRoute } from "./services/signupRoutes.js";
 import { AuthError, authenticateUser } from "./services/auth.js";
 import { publish } from "./jobs/activityBus.js";
 import { checkSupabaseConnection } from "./db/health.js";
@@ -279,6 +280,14 @@ export function createApp(store: Store) {
       // Session probe for both apps. Its own module so that "who am I" cannot
       // drift from the gate that enforces the answer.
       if (await handleMeRoute(req, res, method, path)) return;
+
+      // Account requests. The ONLY unauthenticated write surface in this API —
+      // necessarily so, since the whole point is that the caller does not have
+      // an account yet. Dispatched here, in its own module, so that the one
+      // place without an auth gate is impossible to overlook when reading the
+      // router. It throttles per address and never confirms whether an email
+      // is already known.
+      if (await handleSignupRoute(req, res, method, path)) return;
 
       // Live dependency state, not in-memory bookkeeping.
       //

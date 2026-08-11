@@ -46,6 +46,10 @@ import { jobs as registry } from '../jobs/processingJob.js';
 import { searchAllSuppliers } from './supplierSearch.js';
 import { supplierViewUrl } from '../connectors/index.js';
 import {
+  listSignupRequests,
+  reviewSignupRequest,
+} from '../repositories/signupRequest.repository.js';
+import {
   SyncAlreadyRunningError,
   activeSync,
   lastSync,
@@ -392,6 +396,73 @@ export async function handleAdminRoute(
     // An EAN or SKU is just a query as far as the suppliers are concerned; they
     // match it against their own codes. No special casing is needed, and adding
     // some would only make the admin's search differ from the pipeline's.
+    // ---- Account requests --------------------------------------------------
+    //
+    // The queue of people asking for an account, and the decision that creates
+    // one. Approving does NOT create the account: it authorises the requester's
+    // browser to set a password, and the account exists only once they do. So
+    // an approval that is never claimed leaves nothing behind but a row.
+    //
+    // Each request carries the address and location it came from, and whether
+    // that address was already known to the system. An unknown one is not
+    // evidence of anything on its own — it is the prompt to confirm the email
+    // by some other means before saying yes.
+    if (section === 'signup-requests') {
+      const requestId = segments[3];
+      const decision = segments[4];
+
+      if (method === 'GET' && !requestId) {
+        const statusFilter = new URL(req.url ?? '/', 'http://localhost').searchParams.get(
+          'status',
+        );
+        const valid = ['pending', 'approved', 'rejected', 'completed'] as const;
+        const status = valid.find((entry) => entry === statusFilter);
+
+        const requests = await listSignupRequests(status);
+
+        return sendJson(res, 200, {
+          requests: requests.map((request) => ({
+            ...request,
+            locationLabel: locationLabel(request.location),
+          })),
+          pending: requests.filter((request) => request.status === 'pending').length,
+        });
+      }
+
+      if (method === 'POST' && requestId && (decision === 'approve' || decision === 'reject')) {
+        const body = await readJson(req).catch(() => ({}));
+        const note = typeof body?.note === 'string' ? body.note.trim() : undefined;
+
+        const reviewed = await reviewSignupRequest(
+          requestId,
+          decision === 'approve' ? 'approved' : 'rejected',
+          {
+            ...(user.email ? { email: user.email } : {}),
+            ...(note ? { note } : {}),
+          },
+        );
+
+        // Null means the row was not pending — already decided, or gone. Told
+        // apart from a success so two admins working the queue at once see
+        // what happened rather than both being shown a cheerful confirmation.
+        if (!reviewed) {
+          return sendJson(res, 409, {
+            error: 'That request has already been decided.',
+          });
+        }
+
+        log.info('Account request reviewed', {
+          email: reviewed.email,
+          decision: reviewed.status,
+          by: user.email ?? user.id,
+        });
+
+        return sendJson(res, 200, {
+          request: { ...reviewed, locationLabel: locationLabel(reviewed.location) },
+        });
+      }
+    }
+
     if (method === 'GET' && section === 'search') {
       const query = new URL(req.url ?? '/', 'http://localhost').searchParams.get('q');
       if (!query?.trim()) {
