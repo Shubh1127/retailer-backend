@@ -44,6 +44,7 @@ import {
 } from '../jobs/activityBus.js';
 import { jobs as registry } from '../jobs/processingJob.js';
 import { searchAllSuppliers } from './supplierSearch.js';
+import { supplierViewUrl } from '../connectors/index.js';
 import {
   SyncAlreadyRunningError,
   activeSync,
@@ -418,6 +419,10 @@ export async function handleAdminRoute(
             rrpText: hit.card.rrpText,
             vatText: hit.card.vatText,
             productUrl: hit.card.productUrl,
+            // Where "View on supplier" should actually point. Musgrave's
+            // `productUrl` is an Intershop API resource path that renders
+            // nothing in a browser — see `supplierViewUrl`.
+            viewUrl: supplierViewUrl(supplier, hit.card),
             imageUrl: hit.card.imageUrl,
             unitsPerCase: hit.match.caseConfig?.unitsPerCase,
             unitSize: hit.match.caseConfig?.unitSize,
