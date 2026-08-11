@@ -46,6 +46,7 @@ import { jobs as registry } from '../jobs/processingJob.js';
 import { searchAllSuppliers } from './supplierSearch.js';
 import { supplierViewUrl } from '../connectors/index.js';
 import {
+  accountsExistFor,
   listSignupRequests,
   reviewSignupRequest,
 } from '../repositories/signupRequest.repository.js';
@@ -420,10 +421,19 @@ export async function handleAdminRoute(
 
         const requests = await listSignupRequests(status);
 
+        // Computed here rather than stored on the row: an account can be
+        // created between a request being made and an admin reading it, and a
+        // flag written at insert would then be stale in the direction that
+        // matters. It is also why this needed no migration.
+        const existing = await accountsExistFor(requests.map((entry) => entry.email));
+
         return sendJson(res, 200, {
           requests: requests.map((request) => ({
             ...request,
             locationLabel: locationLabel(request.location),
+            // ADMIN ONLY. Never surfaced by /api/signup/*, where it would be an
+            // email-enumeration oracle.
+            accountExists: existing.has(request.email.trim().toLowerCase()),
           })),
           pending: requests.filter((request) => request.status === 'pending').length,
         });
@@ -432,6 +442,32 @@ export async function handleAdminRoute(
       if (method === 'POST' && requestId && (decision === 'approve' || decision === 'reject')) {
         const body = await readJson(req).catch(() => ({}));
         const note = typeof body?.note === 'string' ? body.note.trim() : undefined;
+
+        // An approval for an address that already has an account cannot
+        // succeed: the requester would set a password, `createUser` would
+        // refuse the duplicate, and they would be left staring at an error
+        // having done everything right. Refused here, where an admin can read
+        // why, rather than failing later where only they can see it.
+        //
+        // Only approval is blocked. Rejecting one of these is exactly the right
+        // action and must stay available.
+        if (decision === 'approve') {
+          const pendingRequest = (await listSignupRequests('pending')).find(
+            (entry) => entry.id === requestId,
+          );
+
+          if (pendingRequest) {
+            const existing = await accountsExistFor([pendingRequest.email]);
+            if (existing.has(pendingRequest.email.trim().toLowerCase())) {
+              return sendJson(res, 409, {
+                error:
+                  'An account already exists for that address. Reject this request ' +
+                  'and tell them to sign in instead — approving it cannot succeed.',
+                accountExists: true,
+              });
+            }
+          }
+        }
 
         const reviewed = await reviewSignupRequest(
           requestId,

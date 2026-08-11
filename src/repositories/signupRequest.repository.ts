@@ -345,6 +345,71 @@ export async function completeSignupRequest(
   return toSignupRequest(data[0] as Record<string, any>);
 }
 
+/**
+ * Which of these addresses already have an account.
+ *
+ * ADMIN-SIDE ONLY. This answer must never reach a public endpoint: "that
+ * address is registered" is an email-enumeration oracle, and the whole reason
+ * `POST /api/signup/requests` answers identically for a known address, an
+ * unknown one and one that already applied is to avoid handing it out. An
+ * administrator asking the same question is already trusted with the user list.
+ *
+ * WHY TWO SOURCES
+ *
+ * `app_users` is written on the first authenticated REQUEST, not at creation —
+ * so an account made moments ago that has not been used yet is not there. The
+ * completed requests cover that: anyone who finished this flow has a row
+ * whatever they have done since.
+ *
+ * The remaining gap is an account created straight in the Supabase dashboard
+ * that has never signed in. That one is caught later, by `createUser` refusing
+ * a duplicate, so approving it fails safely rather than silently.
+ *
+ * Batched deliberately: the queue is read whole, and one query per row would be
+ * four hundred round trips for a two hundred row list.
+ */
+export async function accountsExistFor(emails: readonly string[]): Promise<Set<string>> {
+  const wanted = [...new Set(emails.map(normalizeEmail).filter(Boolean))];
+  if (wanted.length === 0) return new Set();
+
+  const supabase = getSupabaseClient();
+  const found = new Set<string>();
+
+  const [users, completed] = await Promise.all([
+    // `app_users.email` is stored as Supabase reported it, so it is compared
+    // case-insensitively rather than against the normalized form.
+    supabase.from('app_users').select('email').not('email', 'is', null),
+    supabase
+      .from('signup_requests')
+      .select('email_normalized')
+      .eq('status', 'completed')
+      .in('email_normalized', wanted),
+  ]);
+
+  if (users.error) {
+    // Reported, not thrown. This annotates a queue an admin is reading; losing
+    // it costs a badge, and failing the whole list would cost them the queue.
+    log.warn('Could not check existing accounts', { message: users.error.message });
+  } else {
+    const wantedSet = new Set(wanted);
+    for (const row of users.data ?? []) {
+      const email = normalizeEmail(String((row as Record<string, any>).email ?? ''));
+      if (email && wantedSet.has(email)) found.add(email);
+    }
+  }
+
+  if (completed.error) {
+    log.warn('Could not check completed requests', { message: completed.error.message });
+  } else {
+    for (const row of completed.data ?? []) {
+      const email = String((row as Record<string, any>).email_normalized ?? '');
+      if (email) found.add(email);
+    }
+  }
+
+  return found;
+}
+
 /** How many requests are waiting — the badge on the admin nav. */
 export async function countPendingSignupRequests(): Promise<number> {
   const { count, error } = await getSupabaseClient()
