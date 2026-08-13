@@ -120,6 +120,80 @@ async function currentJob(jobId: string) {
   return registry.snapshot(jobId) ?? (await loadJob(jobId));
 }
 
+/**
+ * How long a finished job stays editable.
+ *
+ * A day. Long enough to settle the lines an upload threw up — which is the same
+ * afternoon's work — and short enough that last week's order, which has been
+ * placed with a supplier by now, cannot be quietly rewritten. An admin changing
+ * a line after the order went in produces a record that disagrees with what was
+ * actually bought, and the record is the only thing anyone can check later.
+ */
+const EDIT_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+export interface JobLock {
+  locked: boolean;
+  /** Machine-readable, so the UI can phrase it rather than echo a sentence. */
+  code?: 'expired' | 'in-cart';
+  reason?: string;
+}
+
+/**
+ * May this job still be edited?
+ *
+ * Enforced HERE and not only in the dashboard. A disabled button is a courtesy
+ * to somebody using the screen; it stops nothing that posts straight at the
+ * API, and these routes rewrite what a shop is on record as having ordered.
+ *
+ * Two conditions, in the order that matters most:
+ *
+ *   in-cart   the retailer has put lines from this job into a supplier basket.
+ *             Changing a product now means the basket and the job disagree, and
+ *             the basket is the one that becomes a purchase order.
+ *
+ *   expired   the job finished more than a day ago.
+ *
+ * Cart state outranks age deliberately: a job an hour old whose lines are
+ * already in a basket is MORE dangerous to edit than a quiet three-day-old one,
+ * because something downstream has already acted on it.
+ */
+export function jobEditLock(job: {
+  summary?: { completedAt?: string; startedAt?: string };
+  readyToOrder?: ReadyToOrderRow[];
+}): JobLock {
+  const inCart = (job.readyToOrder ?? []).filter((row) => row.addedToCart === 'Yes');
+  if (inCart.length > 0) {
+    return {
+      locked: true,
+      code: 'in-cart',
+      reason:
+        `${inCart.length} line${inCart.length === 1 ? '' : 's'} from this job ` +
+        'are already in a supplier basket. Change the basket instead — editing ' +
+        'the job now would leave the two disagreeing about what was ordered.',
+    };
+  }
+
+  const finished = job.summary?.completedAt ?? job.summary?.startedAt;
+  const at = finished ? Date.parse(finished) : NaN;
+
+  // An unparseable or absent timestamp leaves the job editable. The cautious
+  // direction here is NOT to lock: a job whose age cannot be established is
+  // more likely to be one still running than one from last week, and locking
+  // those would break the case this feature exists to support.
+  if (Number.isFinite(at) && Date.now() - at > EDIT_WINDOW_MS) {
+    return {
+      locked: true,
+      code: 'expired',
+      reason:
+        'This job is more than a day old. Its lines have almost certainly been ' +
+        'ordered, so it is kept as a record rather than edited. Upload a new ' +
+        'file to change what gets bought.',
+    };
+  }
+
+  return { locked: false };
+}
+
 function findRow(
   ready: ReadyToOrderRow[],
   attention: NeedsAttentionRow[],
@@ -499,6 +573,47 @@ export async function handleAdminRoute(
       }
     }
 
+    // ---- Standing product mappings ----------------------------------------
+    //
+    // Un-teach a description → product mapping, independently of any job row.
+    //
+    // `restore` already clears the mapping a confirmation taught, but only for
+    // the job row that taught it — so a mapping made weeks ago, on a job nobody
+    // is looking at, could only be removed with direct SQL. That matters more
+    // now than it did: a pin made before cross-supplier barcode matching
+    // existed can quietly outrank a cheaper, barcode-verified supplier for ever,
+    // and the only symptom is a line costing more than it should.
+    //
+    // DELETE rather than POST: it removes a thing and is idempotent.
+    if (section === 'product-overrides' && method === 'DELETE') {
+      const body = await readJson(req).catch(() => ({}));
+
+      const description = typeof body?.description === 'string' ? body.description : '';
+      const supplier = typeof body?.supplier === 'string' ? body.supplier.trim() : '';
+      const supplierSku = typeof body?.supplierSku === 'string' ? body.supplierSku.trim() : '';
+
+      if (!description.trim() || !supplier || !supplierSku) {
+        return sendJson(res, 400, {
+          error: 'description, supplier and supplierSku are required',
+        });
+      }
+
+      // Scoped to the exact product the mapping names, never to the whole
+      // description. If somebody has since taught it a DIFFERENT product, that
+      // is a newer decision and must survive — the same rule `restore` follows.
+      const normalizedQuery = overrideKey(description);
+      await clearProductOverride(normalizedQuery, supplier, supplierSku);
+
+      log.info('Standing product mapping cleared', {
+        normalizedQuery,
+        supplier,
+        supplierSku,
+        by: user.email ?? user.id,
+      });
+
+      return sendJson(res, 200, { cleared: true, normalizedQuery });
+    }
+
     if (method === 'GET' && section === 'search') {
       const query = new URL(req.url ?? '/', 'http://localhost').searchParams.get('q');
       if (!query?.trim()) {
@@ -621,6 +736,9 @@ export async function handleAdminRoute(
 
           return sendJson(res, 200, {
             job: stored.summary,
+            // So the page can grey Confirm and Remove and say why, instead of
+            // letting an admin search, choose a product and only then be told.
+            lock: jobEditLock(stored),
             row,
             ...(override ? { override } : {}),
             navigation: {
@@ -639,6 +757,10 @@ export async function handleAdminRoute(
 
         // ---- Every row --------------------------------------------------
         return sendJson(res, 200, {
+          // So the dashboard can grey the controls and say why, rather than
+          // letting an admin fill in a form that the API will refuse. The API
+          // refuses regardless — this is the courtesy, not the enforcement.
+          lock: jobEditLock(stored),
           summary: stored.summary,
           readyToOrder: stored.readyToOrder,
           needsAttention: stored.needsAttention,
@@ -682,6 +804,16 @@ export async function handleAdminRoute(
         const stored = await currentJob(jobId);
         if (!stored) return sendJson(res, 404, { error: 'No such job' });
 
+        // 409, not 403: the caller is entitled to be here, the job's state is
+        // what refuses. Checked before anything is written.
+        const confirmLock = jobEditLock(stored);
+        if (confirmLock.locked) {
+          return sendJson(res, 409, {
+            error: confirmLock.reason,
+            lock: confirmLock.code,
+          });
+        }
+
         const row = findRow(stored.readyToOrder, stored.needsAttention, rowNumber);
         if (!row) return sendJson(res, 404, { error: `No row ${rowNumber}` });
 
@@ -693,6 +825,16 @@ export async function handleAdminRoute(
           supplierSku,
           ...(body.supplierProduct ? { supplierProduct: String(body.supplierProduct) } : {}),
           ...(body.priceExVat !== undefined ? { priceExVat: Number(body.priceExVat) } : {}),
+          // The rest of the product the admin was looking at when they decided.
+          // Stored so the retailer's promoted row shows a picture, a pack and a
+          // price like every matched line beside it, instead of a bare name.
+          ...(body.ean ? { ean: String(body.ean) } : {}),
+          ...(body.imageUrl ? { imageUrl: String(body.imageUrl) } : {}),
+          ...(Number.isFinite(Number(body.unitsPerCase))
+            ? { unitsPerCase: Number(body.unitsPerCase) }
+            : {}),
+          ...(Number.isFinite(Number(body.unitSize)) ? { unitSize: Number(body.unitSize) } : {}),
+          ...(body.uom ? { uom: String(body.uom) } : {}),
           ...(body.reason ? { reason: String(body.reason) } : {}),
           ...(user.email ? { createdByEmail: user.email } : {}),
         });
@@ -745,6 +887,17 @@ export async function handleAdminRoute(
           return sendJson(res, 400, { error: 'Row must be a whole number' });
         }
 
+        const removeJob = await currentJob(jobId);
+        if (!removeJob) return sendJson(res, 404, { error: 'No such job' });
+
+        const removeLock = jobEditLock(removeJob);
+        if (removeLock.locked) {
+          return sendJson(res, 409, {
+            error: removeLock.reason,
+            lock: removeLock.code,
+          });
+        }
+
         let reason: string | undefined;
         try {
           const body = await readJson(req);
@@ -779,6 +932,20 @@ export async function handleAdminRoute(
         if (!Number.isInteger(rowNumber)) {
           return sendJson(res, 400, { error: 'Row must be a whole number' });
         }
+        // Undo is an edit like any other. A job whose lines are in a basket
+        // must not have a decision reversed under it either — the basket was
+        // filled from what the job said at the time.
+        const restoreJob = await currentJob(jobId);
+        if (!restoreJob) return sendJson(res, 404, { error: 'No such job' });
+
+        const restoreLock = jobEditLock(restoreJob);
+        if (restoreLock.locked) {
+          return sendJson(res, 409, {
+            error: restoreLock.reason,
+            lock: restoreLock.code,
+          });
+        }
+
         // Read the decision BEFORE clearing it: undoing the lesson it taught
         // needs to know which product it named.
         const standing = (await loadJobRowOverrides(jobId))[rowNumber];

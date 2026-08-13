@@ -66,6 +66,16 @@ import {
 } from '../repositories/adminOverride.repository.js';
 import { getMatchingConfig } from '../normalization/matchingConfig.js';
 import { buildSearchQueryPlan, RECALL_TARGET } from '../parsing/searchQuery.js';
+import {
+  crossMatchByEan,
+  type CrossMatchDiagnostics,
+  type CrossMatchOptions,
+} from './eanCrossMatch.service.js';
+import { canonicalGtin } from './eanLookup.service.js';
+import {
+  rememberIdentity,
+  resolveByDescription,
+} from '../repositories/productIdentity.repository.js';
 import { splitCompounds } from '../parsing/compoundSplitter.js';
 import { vocabularyFor } from '../parsing/productParser.js';
 import type { ShopArticle } from '../ingest/eposListing.js';
@@ -190,6 +200,34 @@ export interface ReadyToOrderRow {
     differsFromRequest: boolean;
   };
   /**
+   * Set when both suppliers published the SAME barcode for this line.
+   *
+   * Present on the row, not only inside the offers, so the table can badge the
+   * line without opening it — the same reason `adminConfirmed` is here.
+   *
+   * This is an IDENTITY claim and nothing more: two independent catalogues
+   * published the same GS1 number, so it is the same retail product. It says
+   * nothing about the pack. Two suppliers can stock one product in different
+   * case sizes, and one real example in this catalogue lists a "Display Hod"
+   * and a "Box 4 x 5 Pack" under one barcode. Pack and variant differences are
+   * still decided by reconciliation and commercial equivalence, and still
+   * appear in `warnings` — a badge here never means "the offers are
+   * interchangeable".
+   */
+  eanConfirmed?: {
+    /** The canonical GTIN-14 both suppliers agreed on. */
+    gtin14: string;
+    /** What each supplier calls the product, in supplier preference order. */
+    suppliers: {
+      supplier: string;
+      supplierName: string;
+      /** The supplier's own code. */
+      sku?: string;
+      /** The barcode as THAT supplier published it, before canonicalisation. */
+      ean?: string;
+    }[];
+  };
+  /**
    * Why this line did not need a human, when it looked like it might.
    *
    * Present only when the commercial-equivalence stage settled something —
@@ -291,6 +329,11 @@ export type QueryStrategy = 'rules' | 'model';
 
 export interface ProcessArticleOptions {
   maxDetails?: number;
+  /**
+   * Injected in tests so cross-supplier barcode matching runs without a
+   * database. Production leaves it unset and the local catalogues are used.
+   */
+  eanLookup?: CrossMatchOptions['lookup'];
   /** Injected in tests so the pipeline can run without live suppliers. */
   searchers?: {
     musgrave: (query: string) => Promise<RuleCandidate[]>;
@@ -341,6 +384,168 @@ async function findOverride(
 }
 
 // ---- Helpers ---------------------------------------------------------------
+
+/**
+ * Fetch a current price for every SKU the barcode lookup discovered.
+ *
+ * The catalogue told us the product EXISTS at the other supplier and under
+ * which code. It is not allowed to tell us what it costs — that row is only as
+ * fresh as the last sync, and `chooseBestSupplier` would be comparing it
+ * against live prices from the other supplier and could award the line on the
+ * stale one.
+ *
+ * So each discovered SKU is searched at its own supplier, exactly as an
+ * admin-confirmed or persisted-identity SKU is, and the live result replaces
+ * the price-less catalogue candidate. Identity from the catalogue, money from
+ * the supplier.
+ *
+ * Returns the candidate list with discoveries re-priced where possible and
+ * left price-less where not — never with a catalogue price attached.
+ */
+async function repriceDiscovered(
+  crossMatch: { candidates: RuleCandidate[]; diagnostics: CrossMatchDiagnostics | null },
+  opts: ProcessArticleOptions,
+): Promise<RuleCandidate[]> {
+  const discovered = crossMatch.diagnostics?.discovered ?? [];
+  if (discovered.length === 0) return crossMatch.candidates;
+
+  const keyOf = (supplier: string, sku: string) => `${supplier}:${sku}`;
+
+  // One search per discovered SKU, concurrently. Bounded by the top-N cap
+  // upstream, so this is a handful of requests on the lines where discovery
+  // actually fired and none at all on the rest.
+  const results = await Promise.all(
+    discovered.map(async (entry) => {
+      const found = await searchSupplier(entry.supplier, entry.sku, opts);
+      // The supplier's search is free to return anything for a SKU query, so
+      // the answer still has to BE the SKU we asked about — otherwise a
+      // near-miss listing would supply the price for a different product.
+      const exact = found.candidates.find(
+        (candidate) =>
+          candidate.sku && candidate.sku.trim().toUpperCase() === entry.sku.trim().toUpperCase(),
+      );
+      return exact ? { key: keyOf(entry.supplier, entry.sku), live: exact } : null;
+    }),
+  );
+
+  const live = new Map<string, RuleCandidate>();
+  for (const result of results) {
+    if (result) live.set(result.key, result.live);
+  }
+  if (live.size === 0) return crossMatch.candidates;
+
+  return crossMatch.candidates.map((candidate) => {
+    if (!candidate.sku) return candidate;
+
+    const fresh = live.get(keyOf(candidate.supplier, candidate.sku));
+    if (!fresh) return candidate;
+
+    // The live record wins on everything the supplier just told us, but the
+    // barcode confirmation was established from the catalogue row and is
+    // carried across — the live listing may not even state an EAN.
+    return {
+      ...fresh,
+      ...(candidate.ean && !fresh.ean ? { ean: candidate.ean } : {}),
+      ...(candidate.eanExact ? { eanExact: true } : {}),
+    };
+  });
+}
+
+/**
+ * The barcode agreement behind this line, if there is one, for the dashboard.
+ *
+ * Reporting only — nothing downstream reads it, and it changes no decision that
+ * has already been made. It exists because the confirmation was previously
+ * invisible: `eanExact` drove selection and then vanished, so a buyer could not
+ * tell a barcode-verified line from a name match.
+ *
+ * Requires the SAME canonical GTIN on selected products from at least two
+ * suppliers. One supplier publishing a barcode says only what it calls the
+ * product; two independent catalogues publishing the same GS1 number is the
+ * claim worth showing.
+ *
+ * The per-supplier `ean` is each supplier's OWN spelling, not the canonical
+ * form — Musgrave may publish 13 digits where O'Reilly publishes 14 for the
+ * identical product, and showing both is how a buyer checking a shelf edge
+ * sees what each portal will display.
+ */
+function summariseEanConfirmation(
+  selected: readonly SelectedCandidate[],
+  confirmedGtins: readonly string[],
+): ReadyToOrderRow['eanConfirmed'] {
+  if (confirmedGtins.length === 0) return undefined;
+
+  const confirmed = new Set(confirmedGtins);
+
+  for (const gtin14 of confirmed) {
+    const matching = selected.filter(
+      (candidate) => candidate.ean && canonicalGtin(candidate.ean) === gtin14,
+    );
+
+    // Two suppliers or it is not a cross-supplier confirmation.
+    const suppliers = [...new Set(matching.map((candidate) => candidate.supplier))];
+    if (suppliers.length < 2) continue;
+
+    return {
+      gtin14,
+      suppliers: suppliers.map((supplier) => {
+        const candidate = matching.find((entry) => entry.supplier === supplier)!;
+        return {
+          supplier,
+          supplierName: supplierName(supplier),
+          ...(candidate.sku ? { sku: candidate.sku } : {}),
+          ...(candidate.ean ? { ean: candidate.ean } : {}),
+        };
+      }),
+    };
+  }
+
+  return undefined;
+}
+
+/**
+ * Store the GTIN → supplier SKU mapping a successful line established.
+ *
+ * Requires the barcode to have been confirmed at BOTH suppliers. One supplier
+ * publishing a barcode says what it calls the product; two independent
+ * catalogues publishing the same GS1 number is what makes it an identity worth
+ * short-circuiting future work with.
+ */
+async function recordResolvedIdentity(
+  normalizedQuery: string,
+  selected: readonly SelectedCandidate[],
+  confirmedGtins: readonly string[],
+): Promise<void> {
+  if (confirmedGtins.length === 0 || selected.length === 0) return;
+
+  const confirmed = new Set(confirmedGtins);
+
+  for (const gtin14 of confirmed) {
+    const matching = selected.filter(
+      (candidate) => candidate.ean && canonicalGtin(candidate.ean) === gtin14 && candidate.sku,
+    );
+    // Both suppliers, or it is not the cross-supplier identity this records.
+    if (new Set(matching.map((candidate) => candidate.supplier)).size < 2) continue;
+
+    const first = matching[0]!;
+
+    await rememberIdentity({
+      gtin14,
+      ...(first.name ? { name: first.name } : {}),
+      ...(first.brand ? { brand: first.brand } : {}),
+      normalizedQuery,
+      skus: matching.map((candidate) => ({
+        supplierId: candidate.supplier,
+        supplierSku: candidate.sku!,
+        provenance: 'ean_exact' as const,
+        confidence: 1,
+        ...(candidate.unitsPerCase !== undefined ? { unitsPerCase: candidate.unitsPerCase } : {}),
+        ...(candidate.unitSize !== undefined ? { unitSize: candidate.unitSize } : {}),
+        ...(candidate.uom ? { uom: candidate.uom } : {}),
+      })),
+    });
+  }
+}
 
 function supplierName(id: string): string {
   return SUPPLIERS.get(id)?.name ?? id;
@@ -798,10 +1003,48 @@ export async function processArticle(
   // retrieval never returned cannot be recovered at all.
   plan = await buildRetrievalPlan(article, query, normalized, opts);
 
+  // This description has been resolved to a barcode before, and we know which
+  // SKU each supplier sells it under. Ask for those SKUs FIRST.
+  //
+  // This is the read path that makes the persisted mapping worth having: a
+  // repeat upload of the same order file stops re-deriving an identity it
+  // already established, and the ladder short-circuits as soon as rung 0
+  // returns enough candidates.
+  //
+  // It asks the SUPPLIER, not the stored row, on purpose. The mapping is stable
+  // — a barcode does not change — but the price is not, and a shortcut that
+  // also skipped price retrieval would order at last week's cost. Identity is
+  // cached; money never is.
+  //
+  // Skipped when a caller injects its own searchers, matching the convention
+  // `adminOverrides` follows, so tests do not reach a live database.
+  const identity =
+    opts.searchers === undefined ? await resolveByDescription(query) : null;
+
+  if (identity && identity.skus.length > 0) {
+    plan = {
+      ...plan,
+      levels: [
+        ...identity.skus.map((sku, index) => ({
+          level: index,
+          query: sku.supplierSku,
+          rationale: `known ${sku.supplierId} ${sku.supplierSku} for GTIN ${identity.gtin14}`,
+        })),
+        ...plan.levels.map((rung) => ({
+          ...rung,
+          level: rung.level + identity.skus.length,
+        })),
+      ],
+    };
+  }
+
   // A human has already answered this line. Put their SKU at the TOP of the
   // ladder rather than replacing the ladder: suppliers match SKUs in their own
   // search, so this retrieves the confirmed product, and keeping the other
   // rungs means the row still shows alternatives and prices for context.
+  //
+  // Injected AFTER the known-identity rungs so it lands above them: an admin's
+  // answer outranks a barcode, the same order `selectFinal` applies.
   const override = await findOverride(article.description, opts);
   if (override) {
     plan = {
@@ -963,9 +1206,70 @@ export async function processArticle(
           similarity: 0,
         }));
 
+  // --- Cross-supplier barcode confirmation ---------------------------------
+  //
+  // Sits AFTER ranking and BEFORE the rules, which is the only place it can.
+  //
+  // After ranking, because it needs an ordering to decide whose barcode is
+  // worth trusting — the top few, not the top one, so a bad first result cannot
+  // send a confident exact lookup to the wrong product and come back looking
+  // verified. Before the rules, because a confirmation has to be in the
+  // candidate list the rules judge, not bolted onto their verdict afterwards.
+  //
+  // Local indexed reads only — no supplier requests — so this is affordable on
+  // every line. It only ever adds candidates and marks confirmations; nothing
+  // is rejected here.
+  //
+  // Skipped when the caller injects its own searchers and no lookup — the same
+  // convention `adminOverrides` follows. A test supplying fake suppliers must
+  // not have a live database consulted underneath it.
+  const crossMatch =
+    opts.eanLookup || !opts.searchers
+      ? await crossMatchByEan(
+          ranked.map((entry) => entry.candidate),
+          opts.eanLookup ? { lookup: opts.eanLookup } : {},
+        )
+      : { candidates: ranked.map((entry) => entry.candidate), diagnostics: null };
+
+  // --- Re-price what the barcode lookup discovered -------------------------
+  //
+  // A discovered candidate arrives from the synced catalogue with NO price —
+  // see `EanHit.candidate`. Its SKU is fed back through the SAME retrieval the
+  // ladder uses, so the candidate that reaches selection carries a current
+  // supplier price rather than one as old as the last sync.
+  //
+  // This is the third shortcut to work this way, and deliberately identical to
+  // the other two: an admin-confirmed SKU and a persisted-identity SKU both
+  // become rung queries answered by live search. Identity is cached; money
+  // never is.
+  //
+  // A discovery that cannot be re-priced keeps its identity role — it is what
+  // confirms the barcode at both suppliers — but stays price-less, so
+  // reconciliation raises MISSING_PRICE and it cannot win the line on a number
+  // nobody checked.
+  const repriced = await repriceDiscovered(crossMatch, opts);
+
+  // Newly discovered products are appended with neutral similarity: SBERT never
+  // scored them because text retrieval never returned them. That is not a
+  // penalty — a barcode-confirmed candidate is exempt from the ambiguity check
+  // and wins its supplier outright in `selectFinal`, so its similarity is not
+  // what decides it. Existing entries keep their real score and their position.
+  const byKey = new Map(
+    ranked.map((entry) => [`${entry.candidate.supplier}:${entry.candidate.sku ?? entry.candidate.name}`, entry]),
+  );
+
+  const rankedWithEan = repriced.map((candidate, index) => {
+    const existing = byKey.get(`${candidate.supplier}:${candidate.sku ?? candidate.name}`);
+    return {
+      candidateIndex: index,
+      candidate,
+      similarity: existing?.similarity ?? 0,
+    };
+  });
+
   // --- Rules, selection, reconciliation ------------------------------------
-  const judgements = judgeCandidates(target, ranked);
-  const ruled = selectFinal(ranked, judgements);
+  const judgements = judgeCandidates(target, rankedWithEan);
+  const ruled = selectFinal(rankedWithEan, judgements);
 
   // Commercial equivalence sits BETWEEN selection and reconciliation.
   //
@@ -982,7 +1286,7 @@ export async function processArticle(
   // candidate was verified.
   const equivalence = resolveCommercialEquivalence(
     ruled,
-    candidates,
+    crossMatch.candidates,
     judgements,
     opts.commercialEquivalence ?? true,
   );
@@ -1039,6 +1343,21 @@ export async function processArticle(
       },
       base,
     );
+  }
+
+  // --- Remember what this resolved to --------------------------------------
+  //
+  // Written only on the success path, and only for barcodes confirmed at both
+  // suppliers. A candidate that passed the gate on name and pack alone is a
+  // good match, not an established identity, and recording it as one would let
+  // a future upload skip the very checks that made it trustworthy.
+  //
+  // Best effort throughout: `rememberIdentity` never throws, so a failed write
+  // costs a future shortcut and never this line's answer.
+  // Skipped when the caller injects its own searchers, matching the read path
+  // and `adminOverrides`, so a test cannot reach a live database.
+  if (opts.searchers === undefined) {
+    await recordResolvedIdentity(query, gate.safe, crossMatch.diagnostics?.confirmed ?? []);
   }
 
   // --- Ready to order ------------------------------------------------------
@@ -1115,10 +1434,19 @@ export async function processArticle(
         }
       : undefined;
 
+  // Derived from the OFFERS that survived reconciliation, not from the raw
+  // candidate list: a barcode agreement on a product the gate then rejected is
+  // not something to badge the line with.
+  const eanConfirmed = summariseEanConfirmation(
+    gate.safe,
+    crossMatch.diagnostics?.confirmed ?? [],
+  );
+
   const row: ReadyToOrderRow = {
     kind: 'ready',
     warnings,
     ...(adminConfirmed ? { adminConfirmed } : {}),
+    ...(eanConfirmed ? { eanConfirmed } : {}),
     // A confirmation that could not be honoured outranks the equivalence note:
     // one explains a decision the pipeline made, the other says a human's
     // decision was not applied, and only the second needs acting on.

@@ -137,6 +137,23 @@ export interface RuleCandidate {
    */
   multipack?: number;
   /**
+   * The SAME normalised GTIN-14 was found at both suppliers.
+   *
+   * Set by `eanCrossMatch` when a barcode taken from one supplier's listing is
+   * found by exact lookup in the other's catalogue. That is independent
+   * identity evidence of a kind no amount of name similarity can produce: two
+   * organisations that never coordinated published the same GS1 number for the
+   * product.
+   *
+   * Carried, never looked up, for the same reason as `adminConfirmed` — the
+   * rules stay pure functions of their arguments with no database underneath.
+   *
+   * It does NOT assert the packs match. Two suppliers can stock the same retail
+   * unit in different case sizes, so pack and variant are still reconciled
+   * afterwards; this says only "the same product", not "the same offer".
+   */
+  eanExact?: boolean;
+  /**
    * An admin confirmed THIS product for THIS description.
    *
    * Set by the pipeline when a retrieved candidate matches a standing override
@@ -1298,6 +1315,14 @@ export interface SelectedCandidate {
   reason: string;
   /** An admin confirmed this product. See `RuleCandidate.adminConfirmed`. */
   adminConfirmed?: boolean;
+  /**
+   * The same barcode was found at both suppliers. See `RuleCandidate.eanExact`.
+   *
+   * Carried into selection because reconciliation needs it: the variant and
+   * brand rules are a proxy for identity, and a GS1 number agreed by two
+   * independent catalogues answers that question better than a name can.
+   */
+  eanExact?: boolean;
 }
 
 export type SelectionStatus =
@@ -1405,6 +1430,7 @@ function toSelected(
       : {}),
     ...(candidate.imageUrl ? { imageUrl: candidate.imageUrl } : {}),
     ...(candidate.adminConfirmed ? { adminConfirmed: true } : {}),
+    ...(candidate.eanExact ? { eanExact: true } : {}),
     finalConfidence: judgement.finalConfidence,
     sbertSimilarity: judgement.sbertSimilarity,
     reason,
@@ -1488,6 +1514,31 @@ export function selectFinal(
           confirmed.judgement,
           confirmed.candidate,
           `Confirmed by an admin for this description (${supplier}).`,
+        ),
+      );
+      continue;
+    }
+
+    // A barcode confirmed at BOTH suppliers wins its supplier outright, for the
+    // same reason an admin's answer does: the ambiguity check below exists to
+    // avoid guessing between two candidates, and there is nothing to guess when
+    // two independent catalogues published the same GS1 number.
+    //
+    // Ranked BELOW `adminConfirmed` deliberately. A human looked at this line;
+    // a barcode match did not, and where they disagree the person wins.
+    //
+    // This is also what satisfies "the EAN-confirmed candidate becomes primary
+    // and the text candidate remains an alternative": the text candidate is not
+    // discarded, it simply stops being selected, and still reaches the
+    // dashboard through `commercialAlternatives`.
+    const barcodeVerified = sorted.find((pair) => pair.candidate.eanExact);
+    if (barcodeVerified) {
+      selected.push(
+        toSelected(
+          barcodeVerified.judgement,
+          barcodeVerified.candidate,
+          `Same barcode (${barcodeVerified.candidate.ean}) at both suppliers — ` +
+            `identity confirmed independently of the name (${supplier}).`,
         ),
       );
       continue;

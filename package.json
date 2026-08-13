@@ -16,6 +16,7 @@
     "sync:categories": "tsx src/scripts/syncMusgraveCategories.ts",
     "sync:products": "tsx src/scripts/syncMusgraveProducts.ts",
     "sync:oreilly": "tsx src/scripts/syncOreillyProducts.ts",
+    "backfill:musgrave-eans": "tsx src/scripts/backfillMusgraveEans.ts",
     "db:check": "tsx src/scripts/checkSupabase.ts",
     "admin:create-user": "tsx src/scripts/createAdminUser.ts",
     "test:local-match": "tsx src/scripts/testLocalCatalogueMatch.ts",

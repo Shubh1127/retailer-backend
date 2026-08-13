@@ -181,6 +181,7 @@ function readyRecord(jobId: string, row: ReadyToOrderRow, audit?: ProcessedArtic
     dashboard_status: row.warnings.length > 0 ? 'ready-with-warnings' : 'ready',
     warnings: row.warnings,
     admin_confirmed: row.adminConfirmed ?? null,
+    ean_confirmed: row.eanConfirmed ?? null,
     added_to_cart: row.addedToCart === 'Yes',
     alternatives: row.detail.alternatives,
     offers: row.detail.offers,
@@ -459,6 +460,7 @@ export async function loadJob(jobId: string): Promise<StoredJob | null> {
         savingsStatus: record.savings_basis ?? 'no-baseline',
         warnings: record.warnings ?? [],
         ...(record.admin_confirmed ? { adminConfirmed: record.admin_confirmed } : {}),
+        ...(record.ean_confirmed ? { eanConfirmed: record.ean_confirmed } : {}),
         ...(record.savings !== null ? { savings: Number(record.savings) } : {}),
         ...(record.savings_pct !== null ? { savingsPct: Number(record.savings_pct) } : {}),
         ...(record.baseline_cost !== null && record.baseline_cost !== undefined

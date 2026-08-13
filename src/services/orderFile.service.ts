@@ -53,6 +53,10 @@ import {
   type ConfidenceResult,
 } from './matchConfidence.js';
 import {
+  confirmAcrossSuppliers,
+  type CrossMatchOptions,
+} from './eanCrossMatch.service.js';
+import {
   mapWithConcurrency,
   searchAllSuppliers,
   sleep,
@@ -96,6 +100,11 @@ export interface PrepareOrderOptions {
   pauseMs?: number;
   /** Safety cap on how many articles to process from a large listing. */
   maxArticles?: number;
+  /**
+   * Injected in tests so cross-supplier barcode confirmation runs without a
+   * database. Production leaves it unset and the local catalogues are used.
+   */
+  eanLookup?: CrossMatchOptions['lookup'];
 }
 
 /** The EPOS line a match refers back to. */
@@ -256,7 +265,7 @@ function isOrderable(candidate: SupplierCandidate): boolean {
 /** Search every supplier for one EPOS article and score the best result from each. */
 async function searchAndScore(
   article: ShopArticle,
-  opts: { maxDetails: number },
+  opts: { maxDetails: number; eanLookup?: CrossMatchOptions['lookup'] },
 ): Promise<ArticleOutcome> {
   const query = cleanSearchQuery(article.description);
   if (!query) return { article, candidates: [], errors: [] };
@@ -302,12 +311,37 @@ async function searchAndScore(
     });
   }
 
-  // Independent identity evidence: every supplier that answered reported the SAME
-  // GTIN-14 for this description. That is far stronger than any single name match.
-  const gtins = candidates.map((c) => c.gtin);
-  if (candidates.length >= 2 && gtins.every(Boolean) && new Set(gtins).size === 1) {
+  // Independent identity evidence: the same GTIN-14 is stocked by more than one
+  // supplier. Far stronger than any single name match.
+  //
+  // Decided by `confirmAcrossSuppliers`, the SAME function the dashboard
+  // pipeline uses, so the two matchers cannot disagree about whether an
+  // identity is confirmed — which they would if each kept its own rule.
+  //
+  // It also reaches further than the old check did. That one required every
+  // responding supplier to have returned the product by TEXT, so a product
+  // O'Reilly stocks but whose name its search did not surface counted as
+  // unconfirmed. The shared version consults the other supplier's local
+  // catalogue by exact barcode, which finds it. No supplier requests are made.
+  const seen = new Map<'musgrave' | 'oreilly', Set<string>>([
+    ['musgrave', new Set<string>()],
+    ['oreilly', new Set<string>()],
+  ]);
+  for (const candidate of candidates) {
+    const bucket = seen.get(candidate.supplierId as 'musgrave' | 'oreilly');
+    if (bucket && candidate.gtin) bucket.add(candidate.gtin);
+  }
+
+  const { confirmed } = await confirmAcrossSuppliers(
+    seen,
+    opts.eanLookup ? { lookup: opts.eanLookup } : {},
+  );
+
+  if (confirmed.size > 0) {
     for (const candidate of candidates) {
-      candidate.confidence = applyConfidenceBooster(candidate.confidence, 'cross-supplier-ean');
+      if (candidate.gtin && confirmed.has(candidate.gtin)) {
+        candidate.confidence = applyConfidenceBooster(candidate.confidence, 'cross-supplier-ean');
+      }
     }
   }
 
@@ -379,7 +413,10 @@ export async function prepareSupplierOrderFiles(
     opts.concurrency ?? DEFAULT_CONCURRENCY,
     async (article, index) => {
       if (index > 0 && pauseMs > 0) await sleep(pauseMs);
-      return searchAndScore(article, { maxDetails });
+      return searchAndScore(article, {
+        maxDetails,
+        ...(opts.eanLookup ? { eanLookup: opts.eanLookup } : {}),
+      });
     },
   );
 

@@ -22,7 +22,27 @@ export interface JobRowOverride {
   supplier?: string;
   supplierSku?: string;
   supplierProduct?: string;
+  /**
+   * Ex-VAT case price as the admin saw it. Display only — the supplier basket
+   * quotes what is actually charged at order time.
+   */
   priceExVat?: number;
+  /**
+   * The rest of the product the admin chose.
+   *
+   * Stored rather than looked up later for the same reason `processed_products`
+   * stores its offers: this is a record of a decision and must keep saying what
+   * was decided. A lookup at read time would answer with today's catalogue and
+   * quietly rewrite what the admin is on record as approving.
+   *
+   * Without these a confirmed line reached the retailer's table with a name and
+   * nothing else, beside matched lines carrying an image, a pack and a price.
+   */
+  ean?: string;
+  imageUrl?: string;
+  unitsPerCase?: number;
+  unitSize?: number;
+  uom?: string;
   reason?: string;
   createdByEmail?: string;
   createdAt?: string;
@@ -64,6 +84,11 @@ export async function saveJobRowOverride(override: JobRowOverride): Promise<void
       supplier_sku: override.supplierSku ?? null,
       supplier_product: override.supplierProduct ?? null,
       price_ex_vat: override.priceExVat ?? null,
+      ean: override.ean ?? null,
+      image_url: override.imageUrl ?? null,
+      units_per_case: override.unitsPerCase ?? null,
+      unit_size: override.unitSize ?? null,
+      uom: override.uom ?? null,
       reason: override.reason ?? null,
       created_by_email: override.createdByEmail ?? null,
     },
@@ -110,6 +135,11 @@ export async function loadJobRowOverrides(
       ...(raw.supplier_sku ? { supplierSku: String(raw.supplier_sku) } : {}),
       ...(raw.supplier_product ? { supplierProduct: String(raw.supplier_product) } : {}),
       ...(raw.price_ex_vat != null ? { priceExVat: Number(raw.price_ex_vat) } : {}),
+      ...(raw.ean ? { ean: String(raw.ean) } : {}),
+      ...(raw.image_url ? { imageUrl: String(raw.image_url) } : {}),
+      ...(raw.units_per_case != null ? { unitsPerCase: Number(raw.units_per_case) } : {}),
+      ...(raw.unit_size != null ? { unitSize: Number(raw.unit_size) } : {}),
+      ...(raw.uom ? { uom: String(raw.uom) } : {}),
       ...(raw.reason ? { reason: String(raw.reason) } : {}),
       ...(raw.created_by_email ? { createdByEmail: String(raw.created_by_email) } : {}),
       ...(raw.created_at ? { createdAt: String(raw.created_at) } : {}),

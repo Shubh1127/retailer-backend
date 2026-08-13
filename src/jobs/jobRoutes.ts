@@ -40,6 +40,7 @@ import {
   updateJob,
 } from '../repositories/processingJob.repository.js';
 import { loadJobRowOverrides } from '../repositories/adminOverride.repository.js';
+import { jobEditLock } from '../services/adminRoutes.js';
 import { checkAiService } from '../services/aiMatch.client.js';
 import { AuthError, authenticateUser, type AuthUser } from '../services/auth.js';
 import { isRowDecision, publish, subscribeToActivity } from './activityBus.js';
@@ -489,12 +490,18 @@ export async function handleJobRoute(
     if (method === 'GET' && action === 'rows') {
       const overrides = await rowOverridesFor(jobId);
 
+      // The retailer sees the same lock the admin does — not to stop them doing
+      // anything, since they confirm nothing, but because it answers "is this
+      // still being worked on". A closed job will never change again, and the
+      // page can stop polling for a change that cannot arrive.
       const snapshot = registry.snapshot(jobId);
-      if (snapshot) return sendJson(res, 200, { ...snapshot, overrides });
+      if (snapshot) {
+        return sendJson(res, 200, { ...snapshot, overrides, lock: jobEditLock(snapshot) });
+      }
 
       const stored = await loadJob(jobId);
       if (!stored) return sendJson(res, 404, { error: `Unknown job ${jobId}` });
-      return sendJson(res, 200, { ...stored, overrides });
+      return sendJson(res, 200, { ...stored, overrides, lock: jobEditLock(stored) });
     }
 
     // ---- GET /api/jobs/:id/report — CSV ---------------------------------

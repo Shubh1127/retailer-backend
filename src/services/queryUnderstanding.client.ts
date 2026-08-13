@@ -31,8 +31,24 @@ const DEFAULT_BASE_URL = 'http://127.0.0.1:8000';
  */
 const DEFAULT_TIMEOUT_MS = 5_000;
 
+/**
+ * Where the Query Understanding half lives.
+ *
+ * `QUERY_UNDERSTANDING_URL` first, `AI_SERVICE_URL` second.
+ *
+ * The two models can run in one process or two — together they exceed a 500 MB
+ * tier, and they share no state, so which it is stays a deployment choice. A
+ * combined instance sets only `AI_SERVICE_URL` and nothing changes; a split one
+ * points this at its own service. Deliberately a DIFFERENT variable from the
+ * match client's, so pointing one half somewhere new cannot silently move the
+ * other.
+ */
 export function aiServiceBaseUrl(): string {
-  return (process.env.AI_SERVICE_URL ?? DEFAULT_BASE_URL).replace(/\/+$/, '');
+  const url =
+    process.env.QUERY_UNDERSTANDING_URL?.trim() ||
+    process.env.AI_SERVICE_URL?.trim() ||
+    DEFAULT_BASE_URL;
+  return url.replace(/\/+$/, '');
 }
 
 /** Is model-driven query generation switched on? */

@@ -95,6 +95,16 @@ export interface ReconciliationDifference {
    * these ways". Same facts, and the second one is the one a buyer can act on.
    */
   overriddenByAdmin?: boolean;
+  /**
+   * This would have blocked the line, but the same barcode was found at both
+   * suppliers, so identity is settled by a GS1 number rather than by the name
+   * the difference was derived from.
+   *
+   * Only ever set on identity rules — variant and brand. A pack or container
+   * difference is about the OFFER, not the product, and a barcode says nothing
+   * about it.
+   */
+  confirmedByBarcode?: boolean;
 }
 
 export interface ReconciliationResult {
@@ -569,6 +579,42 @@ export function reconcileProduct(
       if (UNORDERABLE.includes(difference.code)) continue;
       difference.severity = 'warning';
       difference.overriddenByAdmin = true;
+    }
+  }
+
+  // A barcode confirmed at BOTH suppliers settles IDENTITY, and only identity.
+  //
+  // The variant and brand rules exist because names are the only evidence of
+  // identity we normally have — they are a proxy. When two independent
+  // catalogues publish the same GS1 number, the proxy is answering a question
+  // that has already been answered better, and it should not be able to
+  // overrule it.
+  //
+  // The case that forced this: an EPOS line reading "BOOST ENERGY RED BRRY CAN"
+  // against a supplier's "Boost Energy Red Berry Drink Can", both carrying
+  // 5000382125464. The retailer mistyped BERRY. `VARIANT_MISMATCH` then read
+  // "requested BRRY, got BERRY DR" and blocked a line whose barcode was
+  // identical at both suppliers — a typo defeating a GS1 number.
+  //
+  // DELIBERATELY NARROW. Only the identity rules are downgraded. Pack, unit
+  // size, container, multipack and alcohol stay critical, because one barcode
+  // genuinely can cover different case levels — this catalogue has a "Display
+  // Hod" and a "Box 4 x 5 Pack" under one number — and those are questions
+  // about the OFFER, which the barcode says nothing about. That is the
+  // distinction between EAN identity and commercial pack equivalence, and it
+  // survives here intact.
+  //
+  // Differences are recorded, never discarded: same code, same reason, same
+  // place in `results`. Only the severity changes, so the dashboard still shows
+  // what differed.
+  const IDENTITY_ONLY: ReconciliationCode[] = ['VARIANT_MISMATCH', 'BRAND_MISMATCH'];
+
+  if (allocated.eanExact) {
+    for (const difference of differences) {
+      if (difference.severity !== 'critical') continue;
+      if (!IDENTITY_ONLY.includes(difference.code)) continue;
+      difference.severity = 'warning';
+      difference.confirmedByBarcode = true;
     }
   }
 

@@ -21,8 +21,24 @@ const log = createLogger('ai-match');
 const DEFAULT_BASE_URL = 'http://127.0.0.1:8000';
 const DEFAULT_TIMEOUT_MS = 20_000;
 
+/**
+ * Where the SBERT half lives.
+ *
+ * `AI_MATCH_URL` first, `AI_SERVICE_URL` second.
+ *
+ * The two models can be deployed as one process or as two — together they
+ * exceed a 500 MB tier, and they share no state, so splitting them is a
+ * deployment choice rather than an architectural one. The fallback is what
+ * keeps that choice invisible here: a single combined instance needs only
+ * `AI_SERVICE_URL`, exactly as before, and a split deployment sets the two
+ * specific variables instead. Nothing in the calling code knows which it is.
+ */
 export function aiServiceBaseUrl(): string {
-  return (process.env.AI_SERVICE_URL ?? DEFAULT_BASE_URL).replace(/\/+$/, '');
+  const url =
+    process.env.AI_MATCH_URL?.trim() ||
+    process.env.AI_SERVICE_URL?.trim() ||
+    DEFAULT_BASE_URL;
+  return url.replace(/\/+$/, '');
 }
 
 /** One supplier product as the AI service expects it. */

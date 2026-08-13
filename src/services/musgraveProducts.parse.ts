@@ -11,6 +11,7 @@
  */
 
 import { createLogger } from '../log.js';
+import { GtinError, normalizeToGtin14 } from '../gtin.js';
 
 const log = createLogger('musgrave:products:parse');
 
@@ -83,6 +84,28 @@ export interface ParsedProduct {
   por?: number;
 
   promotions?: unknown;
+
+  /**
+   * The primary barcode exactly as Musgrave published it, from the `EANCode`
+   * attribute. Verbatim for audit — never join on it, because the same product
+   * is published as UPC-12, EAN-13 or GTIN-14 depending on the row.
+   */
+  ean?: string;
+  /**
+   * `ean` canonicalised by `normalizeToGtin14`. Absent when the barcode fails
+   * its check digit or carries a restricted variable-weight prefix, so an
+   * invalid barcode never becomes an identity key.
+   */
+  gtin14?: string;
+  /**
+   * `AdditionalEAN`, validated and canonicalised, with the primary removed.
+   *
+   * SECONDARY identity only. The published lists mix genuine alternates with
+   * outer-case codes and internal references — one observed row lists
+   * "999813" alongside two GTIN-14s — so no member of this array may be
+   * treated as the retail barcode.
+   */
+  additionalGtins?: string[];
 
   /** The verbatim API element. */
   raw: Record<string, unknown>;
@@ -188,6 +211,47 @@ export function indexAttributes(product: MusgraveApiProduct): Map<string, unknow
   return index;
 }
 
+/**
+ * Canonicalise one barcode, or nothing.
+ *
+ * The single place this module decides what a valid barcode is, and it decides
+ * by asking `normalizeToGtin14` rather than by having an opinion — check digits
+ * and restricted variable-weight prefixes are already settled there, and a
+ * second opinion is a second thing to keep in step.
+ */
+export function toGtin14(value: unknown): string | undefined {
+  const raw = asString(value)?.trim();
+  if (!raw) return undefined;
+  try {
+    return normalizeToGtin14(raw);
+  } catch (error) {
+    // GtinError means "not a usable identity", which is a normal answer for a
+    // catalogue containing in-store scale codes. Anything else is a real fault.
+    if (error instanceof GtinError) return undefined;
+    throw error;
+  }
+}
+
+/**
+ * The `AdditionalEAN` list, validated, de-duplicated, and with the primary
+ * removed so it cannot be counted twice.
+ *
+ * Accepts a bare string as well as an array: the attribute is typed
+ * `MultipleString`, but a single-valued one has been observed arriving
+ * unwrapped, and a lone alternate barcode is worth as much as a list of them.
+ */
+export function additionalGtins(value: unknown, primary?: string): string[] {
+  const values = Array.isArray(value) ? value : value == null ? [] : [value];
+
+  const found = new Set<string>();
+  for (const entry of values) {
+    const gtin = toGtin14(entry);
+    if (gtin && gtin !== primary) found.add(gtin);
+  }
+
+  return [...found];
+}
+
 /** Transform one API element into a typed product. */
 export function parseProduct(
   product: MusgraveApiProduct,
@@ -256,6 +320,24 @@ export function parseProduct(
   assign('taxRate', asNumber(get('taxRate')));
   assign('uciv', asNumber(get('UCIV')));
   assign('por', asNumber(get('POR')));
+
+  // ---- Barcodes ------------------------------------------------------------
+  //
+  // `indexAttributes` already folds `attributeGroup.attributes` in, so both
+  // live in the same lookup as everything else and need no special traversal.
+  //
+  // Only `gtin14` is derived. `ean` is stored verbatim even when it fails
+  // validation, because "the supplier published this and it is not a usable
+  // barcode" is a fact worth keeping — silently dropping it would make a bad
+  // row indistinguishable from one that never had a barcode at all.
+  const rawEan = asString(get('EANCode'))?.trim();
+  if (rawEan) {
+    assign('ean', rawEan);
+    assign('gtin14', toGtin14(rawEan));
+  }
+
+  const additional = additionalGtins(get('AdditionalEAN'), toGtin14(rawEan));
+  if (additional.length > 0) assign('additionalGtins', additional);
 
   const promotions = get('promotions');
   if (promotions !== undefined && promotions !== null) parsed.promotions = promotions;

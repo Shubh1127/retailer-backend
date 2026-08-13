@@ -200,6 +200,74 @@ a missing integration never looks like a routing bug. **The supplier basket is
 the single source of truth** — every mutation returns the basket as it stands
 afterwards, and nothing is cached.
 
+### Account requests
+
+The only unauthenticated write surface in this API — necessarily, since the
+caller does not have an account yet. `supabase.auth.signUp()` is no longer
+called from the browser at all.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/api/signup/requests` | Ask for an account. Body `{ email }`. Returns a **claim token**, once |
+| `GET` | `/api/signup/requests/status` | Has an admin decided? Token in `X-Claim-Token` |
+| `POST` | `/api/signup/requests/complete` | Body `{ claimToken, password }`. Creates the account |
+
+```
+email ──► POST /requests ──► pending ──► admin approves ──► approved
+                │                                              │
+                └── claim token, kept in the browser ───────────┤
+                                                                ▼
+                                          POST /complete ──► the account exists
+```
+
+**No password is taken until the last step.** One collected up front would have
+to be held somewhere between the request and the approval, and there is no good
+answer to where — so `signup_requests` has no password column, hashed or
+otherwise.
+
+**The claim token is what proves the claimant is the requester.** Only its
+SHA-256 is stored. Without it, "this address is approved, set a password" would
+be claimable by anyone who knows the address, which is the whole account for the
+price of a guess. It is single-use and expires seven days after approval.
+
+**Nothing here confirms whether an address is already known.** An unknown
+address, one that already applied, and one that already has an account all
+answer the same way — byte for byte, not merely "similarly" — because the
+difference *is* the disclosure. Requests are throttled per address, 10/minute.
+
+A request from an address that already has an account is therefore still
+created, and the truth surfaces on the **admin** side instead: the queue marks
+it, and `approve` refuses it. That approval could never have succeeded anyway —
+the requester would set a password and `createUser` would reject the duplicate,
+leaving them stuck having done everything right. Rejecting stays available,
+because it is the correct action.
+
+Passwords must be **8+ characters with a capital letter, a number and a special
+character**. `src/services/passwordPolicy.ts` is the authority; the retailer app
+carries a copy for the live checklist, and that copy decides nothing.
+
+Admin side, under the usual `/api/admin` gate:
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/admin/signup-requests?status=` | The queue, with IP, location, the new-address flag and `accountExists` |
+| `POST` | `/api/admin/signup-requests/:id/{approve,reject}` | Decide. Guarded so two admins cannot both win; `approve` refuses when an account already exists |
+
+`accountExists` is computed on every read rather than stored, so an account
+created between the request and the review is still caught. It checks
+`app_users` and completed requests; an account made directly in the Supabase
+dashboard that has never signed in is the one gap, and `createUser` catches that
+one later.
+
+Approving does **not** create the account — it authorises the requester's
+browser to set a password. An approval nobody claims leaves nothing behind.
+
+Each request records the address it came from and whether that address appears
+anywhere in `app_users`, `user_sessions` or an earlier request. It does not, and
+the admin is told to confirm the email out of band before approving. **This is
+only as good as the address**: without `TRUST_PROXY` set behind a proxy, every
+request appears to come from the proxy, and the flag stops meaning anything.
+
 ### Comparison and allocation
 
 | Method | Path | Purpose |
